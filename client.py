@@ -653,7 +653,14 @@ class DFSClient:
         # Spare shard cache — pre-generated extra shards for fast client-side
         # repair without needing to re-read the original file.
         self._spare_shard_dir = Path(cache_dir) / "spare_shards"
-        self._spare_shard_dir.mkdir(parents=True, exist_ok=True)
+        self._spare_shard_enabled = True
+        try:
+            self._spare_shard_dir.mkdir(parents=True, exist_ok=True)
+        except (OSError, PermissionError) as e:
+            log.warning("Cannot create spare shard cache at %s: %s. "
+                       "Client-side repair will be slower.", 
+                       self._spare_shard_dir, e)
+            self._spare_shard_enabled = False
 
     @property
     def using_http(self) -> bool:
@@ -1175,6 +1182,8 @@ class DFSClient:
         This is Wuala's approach: "you could create some extra fragments,
         so you don't have to run it all the time."
         """
+        if not self._spare_shard_enabled:
+            return
         import math
         try:
             # Generate a few extra spare shards per chunk.

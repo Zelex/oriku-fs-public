@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import signal
@@ -55,6 +56,85 @@ from tracker import MetadataTracker, FileMeta, NodeInfo
 from protocol import Message, MsgType, send_message, recv_message
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Authentication — RSA-PSS signature verification (mirrors enso/api.py)
+# ---------------------------------------------------------------------------
+
+# Public routes that don't require authentication.
+# These match the public routes in enso/api.py for consistency.
+PUBLIC_PATHS = {
+    "/api/v1/health",
+    "/api/v1/nodes",
+    "/api/v1/nodes/heartbeat",
+    "/api/v1/shard/fetch",
+    "/api/v1/groups",              # GET only (list public groups)
+    "/api/v1/redundancy",
+    "/api/v1/peers",               # GET only (peer list)
+}
+
+# Paths that are public only for certain HTTP methods.
+PUBLIC_GET_ONLY = {
+    "/api/v1/groups",
+    "/api/v1/peers",
+}
+
+# Max clock skew for request timestamps (seconds).
+AUTH_MAX_SKEW = 120
+
+# In-memory public key registry: fingerprint → PEM bytes.
+# Populated via the /api/v1/register endpoint (TOFU model).
+# This is the fallback for standalone use. When attached to a tracker,
+# the tracker's pubkey_registry is used instead.
+_pubkey_registry: dict = {}  # {fingerprint: {"public_key_pem": str, ...}}
+
+
+def _verify_request_signature(fingerprint: str, timestamp: str,
+                               signature_b64: str, body: bytes,
+                               registry: dict = None) -> bool:
+    """
+    Verify an RSA-PSS signed request.
+
+    The signature covers: "{fingerprint}:{timestamp}:{sha256(body)}"
+
+    Returns True if the signature is valid.
+    """
+    if registry is None:
+        registry = _pubkey_registry
+    try:
+        from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
+        from cryptography.hazmat.primitives import hashes, serialization
+
+        # Check timestamp freshness.
+        req_time = int(timestamp)
+        if abs(time.time() - req_time) > AUTH_MAX_SKEW:
+            return False
+
+        # Look up public key.
+        entry = registry.get(fingerprint)
+        if not entry:
+            return False
+        pem = entry["public_key_pem"].encode("utf-8")
+
+        # Verify signature.
+        body_hash = hashlib.sha256(body).hexdigest()
+        sign_data = f"{fingerprint}:{timestamp}:{body_hash}".encode("utf-8")
+        sig_bytes = base64.urlsafe_b64decode(signature_b64)
+
+        public_key = serialization.load_pem_public_key(pem)
+        public_key.verify(
+            sig_bytes,
+            sign_data,
+            asym_padding.PSS(
+                mgf=asym_padding.MGF1(hashes.SHA256()),
+                salt_length=asym_padding.PSS.MAX_LENGTH,
+            ),
+            hashes.SHA256(),
+        )
+        return True
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +162,58 @@ def create_http_app(tracker: MetadataTracker) -> web.Application:
 
     app = web.Application(client_max_size=64 * 1024 * 1024)  # 64 MiB max body
     app["tracker"] = tracker
+
+    # -- Authentication middleware ------------------------------------------
+    # Mirrors the auth scheme from enso/api.py: signed query params
+    # (_fp, _ts, _sig) verified with RSA-PSS + SHA-256.  Public routes
+    # (health, nodes, shard.fetch) are exempt.
+
+    @web.middleware
+    async def auth_middleware(request, handler):
+        path = request.path
+
+        # Public paths — no auth required.
+        if path in PUBLIC_PATHS:
+            # Some paths are public only for GET.
+            if path in PUBLIC_GET_ONLY and request.method != "GET":
+                pass  # fall through to auth check
+            else:
+                return await handler(request)
+
+        # Public file access (handled separately with its own check).
+        if path.startswith("/api/v1/public/"):
+            return await handler(request)
+
+        # Registration endpoint — TOFU, no prior auth needed.
+        if path == "/api/v1/register":
+            return await handler(request)
+
+        # Extract auth params from query string.
+        fp = request.query.get("_fp", "")
+        ts = request.query.get("_ts", "")
+        sig = request.query.get("_sig", "")
+
+        if not fp or not ts or not sig:
+            return web.json_response(
+                {"error": "missing auth params (_fp, _ts, _sig)"},
+                status=401)
+
+        # Read request body for signature verification.
+        # We peek the body here and store it so handlers can re-read it.
+        body = await request.read()
+
+        # Use the tracker's pubkey registry (shared with TCP auth).
+        registry = request.app["tracker"].pubkey_registry
+        if not _verify_request_signature(fp, ts, sig, body, registry=registry):
+            return web.json_response(
+                {"error": "invalid signature or expired request"},
+                status=403)
+
+        # Stash the verified fingerprint on the request for handlers.
+        request["authenticated_fp"] = fp
+        return await handler(request)
+
+    app.middlewares.append(auth_middleware)
 
     # ── Nodes ──────────────────────────────────────────────
 
@@ -111,6 +243,11 @@ def create_http_app(tracker: MetadataTracker) -> web.Application:
         """POST /api/v1/meta"""
         t: MetadataTracker = request.app["tracker"]
         meta_dict = await request.json()
+        # Authorization: you can only store metadata claiming your own fingerprint.
+        caller_fp = request.get("authenticated_fp", "")
+        if meta_dict.get("owner_fingerprint") != caller_fp:
+            return web.json_response(
+                {"error": "cannot store metadata for another identity"}, status=403)
         fm = FileMeta(**meta_dict)
         t.files[fm.file_id] = fm
         log.info("HTTP: Stored metadata: %s (%s)  %d shards",
@@ -124,16 +261,26 @@ def create_http_app(tracker: MetadataTracker) -> web.Application:
         fm = t.files.get(fid)
         if fm is None:
             return web.json_response({"error": "file_not_found"}, status=404)
+        # Authorization: only the owner or a share grantee can read metadata.
+        caller_fp = request.get("authenticated_fp", "")
+        grantees = {s.get("grantee_fingerprint") for s in fm.shares}
+        if caller_fp != fm.owner_fingerprint and caller_fp not in grantees:
+            return web.json_response({"error": "access denied"}, status=403)
         return web.json_response(asdict(fm))
 
     async def handle_delete_meta(request: web.Request) -> web.Response:
         """DELETE /api/v1/meta/<file_id>"""
         t: MetadataTracker = request.app["tracker"]
         fid = request.match_info["file_id"]
-        if fid in t.files:
-            del t.files[fid]
-            return web.json_response({"status": "ok"})
-        return web.json_response({"error": "file_not_found"}, status=404)
+        if fid not in t.files:
+            return web.json_response({"error": "file_not_found"}, status=404)
+        # Authorization: only the owner can delete their file.
+        caller_fp = request.get("authenticated_fp", "")
+        if t.files[fid].owner_fingerprint != caller_fp:
+            return web.json_response(
+                {"error": "only the owner can delete this file"}, status=403)
+        del t.files[fid]
+        return web.json_response({"status": "ok"})
 
     # ── File listing ───────────────────────────────────────
 
@@ -141,6 +288,11 @@ def create_http_app(tracker: MetadataTracker) -> web.Application:
         """GET /api/v1/files?owner=<fingerprint>"""
         t: MetadataTracker = request.app["tracker"]
         owner_fp = request.query.get("owner", "")
+        # Authorization: you can only list your own files.
+        caller_fp = request.get("authenticated_fp", "")
+        if owner_fp != caller_fp:
+            return web.json_response(
+                {"error": "can only list your own files"}, status=403)
 
         def _fm_dict(fm, shared_with_me=False):
             d = {"file_id": fm.file_id, "logical_path": fm.logical_path,
@@ -205,6 +357,11 @@ def create_http_app(tracker: MetadataTracker) -> web.Application:
         fm = t.files.get(fid)
         if fm is None:
             return web.json_response({"error": "file_not_found"}, status=404)
+        # Authorization: only the owner can share their file.
+        caller_fp = request.get("authenticated_fp", "")
+        if fm.owner_fingerprint != caller_fp:
+            return web.json_response(
+                {"error": "only the owner can share this file"}, status=403)
         share_entry = {
             "grantee_fingerprint": grantee_fp,
             "wrapped_key": wrapped,
@@ -224,6 +381,11 @@ def create_http_app(tracker: MetadataTracker) -> web.Application:
         fm = t.files.get(fid)
         if fm is None:
             return web.json_response({"error": "file_not_found"}, status=404)
+        # Authorization: only the owner can change public status.
+        caller_fp = request.get("authenticated_fp", "")
+        if fm.owner_fingerprint != caller_fp:
+            return web.json_response(
+                {"error": "only the owner can change public status"}, status=403)
         fm.public = bool(public)
         log.info("HTTP: Set public=%s on %s", fm.public, fid[:12])
         return web.json_response({"status": "ok", "public": fm.public})
@@ -248,6 +410,11 @@ def create_http_app(tracker: MetadataTracker) -> web.Application:
         fm = t.files.get(fid)
         if fm is None:
             return web.json_response({"error": "file_not_found"}, status=404)
+        # Authorization: only the owner can revoke shares.
+        caller_fp = request.get("authenticated_fp", "")
+        if fm.owner_fingerprint != caller_fp:
+            return web.json_response(
+                {"error": "only the owner can revoke shares"}, status=403)
         fm.shares = [s for s in fm.shares
                      if s["grantee_fingerprint"] != grantee_fp]
         return web.json_response({"status": "ok"})
@@ -376,8 +543,54 @@ def create_http_app(tracker: MetadataTracker) -> web.Application:
             "uptime": time.time(),
         })
 
+    # ── Identity registration (TOFU — Trust On First Use) ────
+
+    async def handle_register(request: web.Request) -> web.Response:
+        """POST /api/v1/register  {fingerprint, public_key_pem}
+
+        First-use enrollment — associates a fingerprint with a public key.
+        Once registered, the fingerprint cannot be overwritten (prevents
+        identity hijacking).  Mirrors enso/api.py ?r=register.
+        """
+        body = await request.json()
+        fp = body.get("fingerprint", "")
+        pem = body.get("public_key_pem", "")
+        if not fp or not pem:
+            return web.json_response(
+                {"error": "missing fingerprint or public_key_pem"}, status=400)
+
+        # Verify the PEM is valid and the fingerprint matches.
+        try:
+            from cryptography.hazmat.primitives import serialization
+            pub = serialization.load_pem_public_key(pem.encode("utf-8"))
+            canonical_pem = pub.public_bytes(
+                serialization.Encoding.PEM,
+                serialization.PublicFormat.SubjectPublicKeyInfo)
+            computed_fp = hashlib.sha256(canonical_pem).hexdigest()
+            if computed_fp != fp:
+                return web.json_response(
+                    {"error": f"fingerprint does not match public key"}, status=400)
+        except Exception as e:
+            return web.json_response(
+                {"error": f"invalid public key: {e}"}, status=400)
+
+        # Store in the tracker's shared pubkey registry (used by both
+        # HTTP middleware and TCP auth).
+        registry = request.app["tracker"].pubkey_registry
+        if fp in registry:
+            # Already registered — return OK but don't overwrite.
+            return web.json_response({"status": "ok", "fingerprint": fp})
+
+        registry[fp] = {
+            "public_key_pem": pem,
+            "registered_at": time.time(),
+        }
+        log.info("Registered identity: %s…", fp[:16])
+        return web.json_response({"status": "ok", "fingerprint": fp})
+
     # ── Register routes ────────────────────────────────────
 
+    app.router.add_post("/api/v1/register", handle_register)
     app.router.add_post("/api/v1/nodes/heartbeat", handle_heartbeat)
     app.router.add_get("/api/v1/nodes", handle_node_list)
 

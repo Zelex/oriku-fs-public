@@ -203,6 +203,13 @@ class MetadataTracker:
         self.peer_cache: Dict[str, List[dict]] = {}
         self.PEER_TTL = 1800.0  # peers expire after 30 minutes
 
+        # Public key registry for TCP authentication (TOFU model).
+        # fingerprint → {"public_key_pem": str, "registered_at": float}
+        # Populated when clients register via the HTTP API or send signed
+        # TCP messages.  When present, mutating operations (STORE_META,
+        # DELETE_META, SHARE_FILE, etc.) verify the caller's identity.
+        self.pubkey_registry: Dict[str, dict] = {}
+
         self._server: Optional[asyncio.AbstractServer] = None
         self._running = False
         self._repair_task: Optional[asyncio.Task] = None
@@ -901,6 +908,87 @@ class MetadataTracker:
 
     # -- Request handler ----------------------------------------------------
 
+    # Max clock skew for TCP request authentication (seconds).
+    TCP_AUTH_MAX_SKEW = 120
+
+    def _verify_tcp_auth(self, headers: dict) -> str:
+        """
+        Verify authentication headers in a TCP message.
+
+        If headers contain _fp, _ts, _sig, verifies the RSA-PSS signature
+        against the registered public key.  Returns the verified fingerprint
+        on success, or "" on failure/missing auth.
+
+        Authentication is required for mutating operations (STORE_META,
+        DELETE_META, SHARE_FILE, REVOKE_SHARE, SHARE_FOLDER, REVOKE_FOLDER,
+        DEDUP_REGISTER).  Read-only operations remain open for backward
+        compatibility.
+        """
+        fp = headers.get("_fp", "")
+        ts = headers.get("_ts", "")
+        sig_b64 = headers.get("_sig", "")
+
+        if not fp or not ts or not sig_b64:
+            return ""
+
+        try:
+            from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
+            from cryptography.hazmat.primitives import hashes, serialization
+
+            # Check timestamp freshness.
+            req_time = int(ts)
+            if abs(time.time() - req_time) > self.TCP_AUTH_MAX_SKEW:
+                log.warning("TCP auth: expired timestamp from %s…", fp[:12])
+                return ""
+
+            # Look up public key.
+            entry = self.pubkey_registry.get(fp)
+            if not entry:
+                log.warning("TCP auth: unknown fingerprint %s…", fp[:12])
+                return ""
+            pem = entry["public_key_pem"].encode("utf-8")
+
+            # Verify signature over "fingerprint:timestamp".
+            sign_data = f"{fp}:{ts}".encode("utf-8")
+            sig_bytes = base64.b64decode(sig_b64)
+
+            public_key = serialization.load_pem_public_key(pem)
+            public_key.verify(
+                sig_bytes,
+                sign_data,
+                asym_padding.PSS(
+                    mgf=asym_padding.MGF1(hashes.SHA256()),
+                    salt_length=asym_padding.PSS.MAX_LENGTH,
+                ),
+                hashes.SHA256(),
+            )
+            return fp
+        except Exception as exc:
+            log.debug("TCP auth verification failed: %s", exc)
+            return ""
+
+    def _require_auth(self, headers: dict) -> str:
+        """
+        Require valid authentication.  Returns verified fingerprint.
+
+        Raises PermissionError if auth is missing or invalid.
+        If no public keys are registered (fresh tracker with no HTTP API),
+        falls back to trusting the declared owner_fingerprint for backward
+        compatibility.
+        """
+        verified = self._verify_tcp_auth(headers)
+        if verified:
+            return verified
+
+        # Backward compatibility: if no keys are registered at all (pure
+        # TCP mode, no HTTP layer), trust the declared fingerprint.
+        # This preserves existing behavior for local-only setups.
+        if not self.pubkey_registry:
+            return headers.get("owner_fingerprint", "")
+
+        # Keys are registered but this request has no valid auth.
+        raise PermissionError("Authentication required for this operation.")
+
     async def _handle(self, reader: asyncio.StreamReader,
                       writer: asyncio.StreamWriter):
         addr = writer.get_extra_info("peername")
@@ -932,6 +1020,20 @@ class MetadataTracker:
             # — Store file metadata ------------------------------------------
             elif msg.msg_type == MsgType.STORE_META:
                 meta_dict = json.loads(msg.payload.decode("utf-8"))
+                # Authentication: verify the caller owns this fingerprint.
+                try:
+                    caller_fp = self._require_auth(msg.headers)
+                    # Only enforce identity check when we got a verified fp.
+                    if caller_fp and meta_dict.get("owner_fingerprint") and \
+                       meta_dict["owner_fingerprint"] != caller_fp:
+                        await send_message(writer, Message(
+                            MsgType.ERROR,
+                            {"reason": "cannot store metadata for another identity"}))
+                        return
+                except PermissionError:
+                    await send_message(writer, Message(
+                        MsgType.ERROR, {"reason": "authentication_required"}))
+                    return
                 fm = FileMeta(**meta_dict)
                 self.files[fm.file_id] = fm
                 # Update content index for cross-user dedup.
@@ -957,7 +1059,14 @@ class MetadataTracker:
                 fid = msg.headers.get("file_id")
                 if fid in self.files:
                     fm = self.files[fid]
-                    requester_fp = msg.headers.get("owner_fingerprint", "")
+                    # Authentication: verify the caller is the file owner.
+                    try:
+                        caller_fp = self._require_auth(msg.headers)
+                    except PermissionError:
+                        await send_message(writer, Message(
+                            MsgType.ERROR, {"reason": "authentication_required"}))
+                        return
+                    requester_fp = caller_fp or msg.headers.get("owner_fingerprint", "")
                     # Cross-user dedup: if other owners still reference this
                     # file, just remove this owner's ref — don't delete shards.
                     if fm.owner_refs:
@@ -1066,23 +1175,35 @@ class MetadataTracker:
                 if fm is None:
                     await send_message(writer,
                                        Message(MsgType.ERROR, {"reason": "file_not_found"}))
-                elif "public" in msg.headers:
-                    # Set/clear public flag
-                    fm.public = bool(msg.headers["public"])
-                    log.info("Set public=%s on %s", fm.public, fid[:12])
-                    await send_message(writer, Message(MsgType.ACK))
                 else:
-                    grantee_fp = msg.headers.get("grantee_fingerprint")
-                    wrapped_for_grantee = msg.headers.get("wrapped_key")  # base64
-                    share_entry = {
-                        "grantee_fingerprint": grantee_fp,
-                        "wrapped_key": wrapped_for_grantee,
-                    }
-                    if msg.headers.get("logical_path"):
-                        share_entry["logical_path"] = msg.headers["logical_path"]
-                    fm.shares.append(share_entry)
-                    log.info("Shared %s with %s…", fid[:12], grantee_fp[:12])
-                    await send_message(writer, Message(MsgType.ACK))
+                    # Authentication: only the owner can share.
+                    try:
+                        caller_fp = self._require_auth(msg.headers)
+                    except PermissionError:
+                        await send_message(writer, Message(
+                            MsgType.ERROR, {"reason": "authentication_required"}))
+                        return
+                    if caller_fp and caller_fp != fm.owner_fingerprint:
+                        await send_message(writer, Message(
+                            MsgType.ERROR, {"reason": "only_owner_can_share"}))
+                        return
+                    if "public" in msg.headers:
+                        # Set/clear public flag
+                        fm.public = bool(msg.headers["public"])
+                        log.info("Set public=%s on %s", fm.public, fid[:12])
+                        await send_message(writer, Message(MsgType.ACK))
+                    else:
+                        grantee_fp = msg.headers.get("grantee_fingerprint")
+                        wrapped_for_grantee = msg.headers.get("wrapped_key")  # base64
+                        share_entry = {
+                            "grantee_fingerprint": grantee_fp,
+                            "wrapped_key": wrapped_for_grantee,
+                        }
+                        if msg.headers.get("logical_path"):
+                            share_entry["logical_path"] = msg.headers["logical_path"]
+                        fm.shares.append(share_entry)
+                        log.info("Shared %s with %s…", fid[:12], grantee_fp[:12])
+                        await send_message(writer, Message(MsgType.ACK))
 
             # — Revoke sharing ------------------------------------------------
             elif msg.msg_type == MsgType.REVOKE_SHARE:
@@ -1093,6 +1214,17 @@ class MetadataTracker:
                     await send_message(writer,
                                        Message(MsgType.ERROR, {"reason": "file_not_found"}))
                 else:
+                    # Authentication: only the owner can revoke shares.
+                    try:
+                        caller_fp = self._require_auth(msg.headers)
+                    except PermissionError:
+                        await send_message(writer, Message(
+                            MsgType.ERROR, {"reason": "authentication_required"}))
+                        return
+                    if caller_fp and caller_fp != fm.owner_fingerprint:
+                        await send_message(writer, Message(
+                            MsgType.ERROR, {"reason": "only_owner_can_revoke"}))
+                        return
                     fm.shares = [s for s in fm.shares
                                  if s["grantee_fingerprint"] != grantee_fp]
                     await send_message(writer, Message(MsgType.ACK))

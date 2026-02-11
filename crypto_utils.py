@@ -16,6 +16,7 @@ import base64
 import json
 import os
 import hashlib
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Tuple, Optional
@@ -196,10 +197,24 @@ class KeyPair:
         if password:
             # Encrypt private key with password and save as JSON.
             blob = password_encrypt_key(kp.private_pem(), password)
-            (kd / "id_rsa.enc").write_text(json.dumps(blob, indent=2))
+            enc_path = kd / "id_rsa.enc"
+            enc_path.write_text(json.dumps(blob, indent=2))
+            # Restrict permissions: owner read/write only (0600).
+            try:
+                enc_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+            except OSError:
+                pass  # Windows may not support Unix permissions
         else:
             # Save raw PEM (legacy).
-            (kd / "id_rsa").write_bytes(kp.private_pem())
+            priv_path = kd / "id_rsa"
+            priv_path.write_bytes(kp.private_pem())
+            # Restrict permissions: owner read/write only (0600).
+            # This prevents other users on shared systems from reading
+            # the private key.
+            try:
+                priv_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+            except OSError:
+                pass  # Windows may not support Unix permissions
 
         return kp
 

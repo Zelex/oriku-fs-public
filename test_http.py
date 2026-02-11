@@ -68,6 +68,11 @@ async def test():
 
     assert alice_client.using_http, "Should be using HTTP transport"
 
+    # Register identities with the server (required for authenticated requests).
+    await alice_client.ensure_registered()
+    await bob_client.ensure_registered()
+    await eve_client.ensure_registered()
+
     # ── TEST 1: Upload via HTTP ───────────────────────────
     test_data = b"Hello from HTTP transport! " * 500  # ~13 KB
     fid = await alice_client.put("/http-test/hello.txt", test_data)

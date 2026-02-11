@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.eca/
+node_storage/
+cache*/
+keys/
+enso/files.json
+enso/nodes.json
+enso/staging/
+enso/*.lock
+enso/*.tmp
+enso_errors.log
+

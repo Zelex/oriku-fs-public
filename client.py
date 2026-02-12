@@ -600,6 +600,11 @@ class TitForTat:
 # DFS Client
 # ---------------------------------------------------------------------------
 
+class _NodeFullError(RuntimeError):
+    """Raised when a storage node rejects a shard due to insufficient capacity."""
+    pass
+
+
 class DFSClient:
 
     # -- Shard token generation (matches storage_node HMAC verification) ----
@@ -799,16 +804,27 @@ class DFSClient:
                     ) as resp:
                         if resp.status == 200:
                             return  # Success — direct transfer worked!
+                        if resp.status == 507:
+                            raise _NodeFullError(
+                                f"Node {node['node_id']} is full")
                         log.debug("Direct store shard %d to %s: HTTP %d",
                                   index, durl, resp.status)
+                except _NodeFullError:
+                    raise  # propagate capacity errors immediately
                 except Exception as exc:
                     log.debug("Direct store shard %d to %s failed: %s",
                               index, durl, exc)
 
         # -- Fallback to tracker proxy ------------------------------------
         if self._http:
-            await self._http.store_shard(
-                node["node_id"], file_id, index, data)
+            try:
+                await self._http.store_shard(
+                    node["node_id"], file_id, index, data)
+            except RuntimeError as e:
+                if "insufficient_capacity" in str(e):
+                    raise _NodeFullError(
+                        f"Node {node['node_id']} is full") from e
+                raise
         else:
             resp = await _request(
                 node["host"], node["port"],
@@ -817,6 +833,10 @@ class DFSClient:
                         data),
             )
             if resp.msg_type != MsgType.ACK:
+                reason = resp.headers.get("reason", "")
+                if reason == "insufficient_capacity":
+                    raise _NodeFullError(
+                        f"Node {node['node_id']} is full")
                 raise RuntimeError(
                     f"Failed to store shard {index} on "
                     f"{node['node_id']}: {resp.headers}")
@@ -924,11 +944,28 @@ class DFSClient:
             chunk_shard_hashes: Dict[str, str] = {}
 
             # Upload all shards for this chunk in parallel.
+            # If a node is full, try the next node in the ring.
+            full_nodes: set = set()
+
             async def _upload_shard(shard, base=base_idx):
                 gidx = base + shard.index
-                node = ordered[gidx % len(ordered)]
-                await self._store_shard(node, fid, gidx, shard.data)
-                return gidx, node["node_id"], shard.sha256
+                # Try nodes in ring order, skipping known-full ones.
+                for attempt in range(len(ordered)):
+                    candidate = ordered[(gidx + attempt) % len(ordered)]
+                    if candidate["node_id"] in full_nodes:
+                        continue
+                    try:
+                        await self._store_shard(
+                            candidate, fid, gidx, shard.data)
+                        return gidx, candidate["node_id"], shard.sha256
+                    except _NodeFullError:
+                        full_nodes.add(candidate["node_id"])
+                        log.warning("  Node %s full, trying next…",
+                                    candidate["node_id"][:16])
+                        continue
+                raise RuntimeError(
+                    f"All {len(ordered)} nodes are full — "
+                    f"cannot store shard {gidx}")
 
             results = await asyncio.gather(
                 *[_upload_shard(s) for s in chunk_shards])
@@ -1515,7 +1552,24 @@ class DFSClient:
             if spare_data is not None:
                 target = preferred[repaired % len(preferred)]
                 try:
-                    await self._store_shard(target, file_id, idx, spare_data)
+                    try:
+                        await self._store_shard(target, file_id, idx, spare_data)
+                    except _NodeFullError:
+                        stored = False
+                        for alt in preferred:
+                            if alt["node_id"] == target["node_id"]:
+                                continue
+                            try:
+                                await self._store_shard(
+                                    alt, file_id, idx, spare_data)
+                                target = alt
+                                stored = True
+                                break
+                            except _NodeFullError:
+                                continue
+                        if not stored:
+                            remaining.append(idx_str)
+                            continue
                     shard_map[idx_str] = target["node_id"]
                     repaired += 1
                     log.info("Spare repair: shard %s/%s → %s",
@@ -2430,11 +2484,26 @@ class DFSClient:
             chunk_shard_hashes: Dict[str, str] = {}
 
             # Upload all shards for this chunk in parallel.
+            full_nodes_delta: set = set()
+
             async def _upload_delta_shard(shard, base=base_idx):
                 gidx = base + shard.index
-                node = ordered[gidx % len(ordered)]
-                await self._store_shard(node, fid, gidx, shard.data)
-                return gidx, node["node_id"], shard.sha256
+                for attempt in range(len(ordered)):
+                    candidate = ordered[(gidx + attempt) % len(ordered)]
+                    if candidate["node_id"] in full_nodes_delta:
+                        continue
+                    try:
+                        await self._store_shard(
+                            candidate, fid, gidx, shard.data)
+                        return gidx, candidate["node_id"], shard.sha256
+                    except _NodeFullError:
+                        full_nodes_delta.add(candidate["node_id"])
+                        log.warning("  Node %s full, trying next…",
+                                    candidate["node_id"][:16])
+                        continue
+                raise RuntimeError(
+                    f"All {len(ordered)} nodes are full — "
+                    f"cannot store shard {gidx}")
 
             shard_results = await asyncio.gather(
                 *[_upload_delta_shard(s) for s in chunk_shards])
@@ -2849,7 +2918,26 @@ class DFSClient:
 
             target = preferred[repaired % len(preferred)]
             try:
-                await self._store_shard(target, fid, idx, shard.data)
+                try:
+                    await self._store_shard(target, fid, idx, shard.data)
+                except _NodeFullError:
+                    # Try other preferred nodes.
+                    stored = False
+                    for alt in preferred:
+                        if alt["node_id"] == target["node_id"]:
+                            continue
+                        try:
+                            await self._store_shard(alt, fid, idx, shard.data)
+                            target = alt
+                            stored = True
+                            break
+                        except _NodeFullError:
+                            continue
+                    if not stored:
+                        log.warning("Repair: all nodes full for shard %s/%s",
+                                    fid[:12], idx_str)
+                        failed += 1
+                        continue
 
                 # Update global shard map.
                 shard_map[idx_str] = target["node_id"]

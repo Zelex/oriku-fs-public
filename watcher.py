@@ -363,7 +363,16 @@ class DirectoryWatcher:
         tracked = self.db.all_tracked_paths()
 
         # --- Detect new and modified files ---
-        for rel_path, abs_path in on_disk.items():
+        # Sort by size (smallest first) so small files sync quickly
+        # instead of being blocked behind a single large upload.
+        def _file_size(item):
+            try:
+                return item[1].stat().st_size
+            except OSError:
+                return 0
+        sorted_items = sorted(on_disk.items(), key=_file_size)
+
+        for rel_path, abs_path in sorted_items:
             try:
                 stat = abs_path.stat()
             except OSError:

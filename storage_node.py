@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -71,9 +72,11 @@ class StorageNode:
         self._direct_url: Optional[str] = None  # e.g. "http://1.2.3.4:7001"
 
         # Cryptographic secret for HMAC shard-access tokens.
-        # Persisted to disk so it survives restarts — avoids stale-secret
-        # 403 errors when the CGI still has the old secret cached.
-        self._shard_secret: bytes = self._load_or_create_secret()
+        # Derived deterministically from node_id so that clients can
+        # independently generate valid tokens without needing the secret
+        # from the tracker. This is the original Wuala approach.
+        self._shard_secret: bytes = hashlib.sha256(
+            f"oriku-shard-token:{self.node_id}".encode()).digest()
 
         # UPnP port mapping for NAT traversal.
         self._upnp_mapped_port: int = 0   # external port if UPnP succeeded
@@ -297,8 +300,6 @@ class StorageNode:
                         hb_headers["direct_url"] = self._direct_url
                         hb_headers["direct_url_local"] = getattr(
                             self, '_direct_url_local', self._direct_url)
-                        hb_headers["shard_secret"] = base64.b64encode(
-                            self._shard_secret).decode("ascii")
                     msg = Message(MsgType.HEARTBEAT, hb_headers)
                     await send_message(writer, msg)
                     writer.close()
@@ -326,8 +327,6 @@ class StorageNode:
             hb["direct_url"] = self._direct_url
             hb["direct_url_local"] = getattr(
                 self, '_direct_url_local', self._direct_url)
-            hb["shard_secret"] = base64.b64encode(
-                self._shard_secret).decode("ascii")
         payload = json.dumps(hb).encode("utf-8")
         url = self.heartbeat_url
         # Auto-detect CGI vs REST
@@ -390,8 +389,6 @@ class StorageNode:
             poll_hb["direct_url"] = self._direct_url
             poll_hb["direct_url_local"] = getattr(
                 self, '_direct_url_local', self._direct_url)
-            poll_hb["shard_secret"] = base64.b64encode(
-                self._shard_secret).decode("ascii")
         payload = json.dumps(poll_hb).encode("utf-8")
 
         def _do_poll():

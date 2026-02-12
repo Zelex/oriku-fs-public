@@ -325,21 +325,30 @@ def convergent_key(plaintext: bytes) -> bytes:
 
 
 def encrypt_blob(plaintext: bytes, key: bytes,
-                  chunk_index: int = None) -> Tuple[bytes, bytes]:
+                  chunk_index: int = None,
+                  deterministic: bool = False) -> Tuple[bytes, bytes]:
     """
     Encrypt *plaintext* with AES-256-GCM.
 
     Returns ``(nonce, ciphertext)``.
 
-    If *chunk_index* is provided (for chunked files that share one key),
-    the nonce is derived deterministically: 4 random bytes + 4 bytes of
-    chunk_index + 4 random bytes.  This guarantees uniqueness across chunks
-    while keeping 8 bytes of randomness to prevent prediction.
+    If *deterministic* is True (convergent encryption), the nonce is derived
+    from HMAC-SHA256(key, chunk_index) so identical content always produces
+    identical ciphertext and shards — required for dedup to work.
 
-    For single-blob encryption (chunk_index=None), a fully random 96-bit
-    nonce is used.
+    Otherwise, if *chunk_index* is provided, the nonce mixes random bytes
+    with the chunk index for uniqueness.  For single-blob encryption
+    (chunk_index=None), a fully random 96-bit nonce is used.
     """
-    if chunk_index is not None:
+    if deterministic:
+        # Convergent mode: nonce must be deterministic so identical
+        # plaintext + key always produces identical ciphertext/shards.
+        import hmac as _hmac
+        ci = chunk_index if chunk_index is not None else 0
+        nonce = _hmac.new(
+            key, f"convergent-nonce:{ci}".encode(), hashlib.sha256
+        ).digest()[:12]  # 96-bit nonce
+    elif chunk_index is not None:
         import struct
         nonce = (os.urandom(4)
                  + struct.pack("!I", chunk_index)

@@ -910,7 +910,10 @@ class DFSClient:
             chunk_data = data[chunk_start : chunk_start + self.chunk_size]
 
             # 1. Encrypt this chunk with the shared AES key + unique nonce.
-            chunk_nonce, chunk_ct = encrypt_blob(chunk_data, aes_key)
+            chunk_nonce, chunk_ct = encrypt_blob(
+                chunk_data, aes_key,
+                chunk_index=ci,
+                deterministic=convergent)
 
             # 2. Erasure-code the chunk ciphertext.
             chunk_shards = self.coder.encode(chunk_ct, fid)
@@ -2416,7 +2419,10 @@ class DFSClient:
                 continue
 
             # Chunk is new or changed — encrypt and upload.
-            chunk_nonce, chunk_ct = encrypt_blob(chunk_data, aes_key)
+            chunk_nonce, chunk_ct = encrypt_blob(
+                chunk_data, aes_key,
+                chunk_index=ci,
+                deterministic=convergent)
             chunk_shards = self.coder.encode(chunk_ct, fid)
 
             base_idx = ci * shards_per_chunk

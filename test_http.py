@@ -48,7 +48,8 @@ async def test():
             node_id=f"node-{i}", host="127.0.0.1", port=0,
             storage_dir="./node_storage",
             tracker_host="127.0.0.1", tracker_port=tcp_port,
-            donated_bytes=100 * 1024 ** 2)
+            donated_bytes=100 * 1024 ** 2,
+            advertise_host="127.0.0.1")
         await n.start()
         nodes.append(n)
     await asyncio.sleep(2)  # let heartbeats register
@@ -107,13 +108,15 @@ async def test():
         node_id="node-0", host="127.0.0.1",
         port=nodes[0].port, storage_dir="./node_storage",
         tracker_host="127.0.0.1", tracker_port=tcp_port,
-        donated_bytes=100 * 1024 ** 2)
+        donated_bytes=100 * 1024 ** 2,
+        advertise_host="127.0.0.1")
     await nodes[0].start()
     nodes[1] = StorageNode(
         node_id="node-1", host="127.0.0.1",
         port=nodes[1].port, storage_dir="./node_storage",
         tracker_host="127.0.0.1", tracker_port=tcp_port,
-        donated_bytes=100 * 1024 ** 2)
+        donated_bytes=100 * 1024 ** 2,
+        advertise_host="127.0.0.1")
     await nodes[1].start()
     await asyncio.sleep(1)
 

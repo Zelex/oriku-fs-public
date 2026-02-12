@@ -232,7 +232,8 @@ def create_http_app(tracker: MetadataTracker) -> web.Application:
              "free_bytes": n.free_bytes, "donated_bytes": n.donated_bytes,
              "used_bytes": n.used_bytes, "shard_count": n.shard_count,
              "availability": round(n.availability, 3), "alive": n.alive,
-             "direct_url": n.direct_url}
+             "direct_url": n.direct_url,
+             "shard_secret": n.shard_secret}
             for n in t.alive_nodes()
         ]
         return web.json_response({"nodes": nodes})

@@ -420,9 +420,12 @@ async def run_tests():
 
         async with aiohttp.ClientSession() as session:
             # Generate HMAC shard token (matches storage_node verification).
+            # Grab the node's random secret from the storage node object.
+            sn = [n for n in cluster.nodes if n.node_id == node_id][0]
             token = alice._shard_token(
                 node_id, alice.keypair.fingerprint(),
-                fid_direct, int(shard_idx))
+                fid_direct, int(shard_idx),
+                shard_secret=sn._shard_secret)
             url = (f"{node_info.direct_url}/shard"
                    f"?file_id={fid_direct}&index={shard_idx}"
                    f"&token={token}")

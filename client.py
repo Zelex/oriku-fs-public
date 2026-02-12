@@ -262,10 +262,21 @@ class HTTPTransport:
         headers["Content-Type"] = "application/json"
         return self._session.post(url, data=body, headers=headers, **kwargs)
 
+    async def _delete(self, url: str, **kwargs) -> 'aiohttp.ClientResponse':
+        """DELETE request."""
+        await self._ensure_session()
+        return self._session.delete(url, **kwargs)
+
     # -- Tracker operations -------------------------------------------------
 
     async def get_alive_nodes(self) -> List[dict]:
-        async with await self._get(self._url("nodes")) as resp:
+        # Send auth params if available — the server includes shard_secret
+        # for authenticated callers, needed for direct node transfers.
+        if self._keypair:
+            url = self._signed_url("nodes")
+        else:
+            url = self._url("nodes")
+        async with await self._get(url) as resp:
             data = await resp.json()
             return data.get("nodes", [])
 
@@ -283,13 +294,21 @@ class HTTPTransport:
         async with await self._get(url) as resp:
             if resp.status == 404:
                 raise FileNotFoundError(f"File {file_id} not found.")
+            if resp.status == 403:
+                raise PermissionError(f"Access denied for file {file_id}.")
             return await resp.json()
 
     async def delete_meta(self, file_id: str) -> None:
         url = self._signed_meta_delete_url(file_id)
-        async with await self._get(url) as resp:
-            if resp.status == 404:
-                raise FileNotFoundError(f"File {file_id} not found.")
+        # CGI mode uses GET with ?r=meta.delete; REST mode needs DELETE method.
+        if self._cgi:
+            async with await self._get(url) as resp:
+                if resp.status == 404:
+                    raise FileNotFoundError(f"File {file_id} not found.")
+        else:
+            async with await self._delete(url) as resp:
+                if resp.status == 404:
+                    raise FileNotFoundError(f"File {file_id} not found.")
 
     async def list_files(self, owner_fingerprint: str) -> List[dict]:
         url = self._signed_url("files", owner=owner_fingerprint)
@@ -588,15 +607,25 @@ class DFSClient:
 
     @staticmethod
     def _shard_token(node_id: str, owner_fp: str,
-                     file_id: str, index: int) -> str:
+                     file_id: str, index: int,
+                     shard_secret: bytes = None) -> str:
         """Generate an HMAC-SHA256 token for direct shard access.
 
         Must match the verification logic in StorageNode._verify_token().
+
+        The *shard_secret* is a per-node random secret received from the
+        tracker via the node list. If not available, falls back to a
+        deterministic derivation (legacy, less secure).
         """
         import hmac, hashlib, time as _time
-        secret = hashlib.sha256(
-            f"oriku-shard-token:{node_id}".encode()
-        ).digest()
+        if shard_secret:
+            secret = shard_secret
+        else:
+            # Legacy fallback — only used if tracker hasn't provided the
+            # node's random secret yet.
+            secret = hashlib.sha256(
+                f"oriku-shard-token:{node_id}".encode()
+            ).digest()
         ts = str(int(_time.time()))
         msg = f"{file_id}:{index}:{ts}".encode()
         mac = hmac.new(secret, msg, hashlib.sha256).hexdigest()
@@ -756,9 +785,13 @@ class DFSClient:
             try:
                 import aiohttp as _aiohttp
                 await self._http._ensure_session()
+                _secret = None
+                if node.get("shard_secret"):
+                    import base64 as _b64
+                    _secret = _b64.b64decode(node["shard_secret"])
                 token = self._shard_token(
                     node["node_id"], self.keypair.fingerprint(),
-                    file_id, index)
+                    file_id, index, shard_secret=_secret)
                 url = (f"{direct_url}/shard"
                        f"?file_id={file_id}&index={index}"
                        f"&token={token}")
@@ -1181,6 +1214,11 @@ class DFSClient:
 
         This is Wuala's approach: "you could create some extra fragments,
         so you don't have to run it all the time."
+
+        IMPORTANT: We must re-use the SAME (nonce, ciphertext) that was used
+        during the original upload. Re-encrypting with a new nonce would
+        produce different ciphertext, making the spare shards incompatible
+        with the original shards for Reed-Solomon decoding.
         """
         if not self._spare_shard_enabled:
             return
@@ -1195,7 +1233,19 @@ class DFSClient:
             for ci in range(num_chunks):
                 chunk_start = ci * self.chunk_size
                 chunk_data = data[chunk_start:chunk_start + self.chunk_size]
-                chunk_nonce, chunk_ct = encrypt_blob(chunk_data, aes_key)
+
+                # Re-use the original nonce from the upload so we get the
+                # exact same ciphertext.  The spare shards MUST be erasure-
+                # coded from the same ciphertext as the original shards,
+                # otherwise Reed-Solomon reconstruction will fail.
+                cm = chunks_meta[ci] if ci < len(chunks_meta) else None
+                if not cm or "nonce" not in cm:
+                    continue
+                original_nonce = bytes.fromhex(cm["nonce"])
+                from cryptography.hazmat.primitives.ciphers.aead import AESGCM as _AESGCM
+                chunk_ct = _AESGCM(aes_key).encrypt(
+                    original_nonce, chunk_data, associated_data=None)
+
                 # Re-encode with extra parity.
                 try:
                     all_shards = spare_coder.encode(chunk_ct, file_id)
@@ -1735,11 +1785,16 @@ class DFSClient:
 
         # --- Tier 2: Direct node transfer ---------------------------------
         node_direct_urls: Dict[str, str] = {}
+        node_shard_secrets: Dict[str, bytes] = {}
         try:
             nodes = await self.get_alive_nodes()
             for n in nodes:
                 if n.get("direct_url"):
                     node_direct_urls[n["node_id"]] = n["direct_url"]
+                    if n.get("shard_secret"):
+                        import base64 as _b64
+                        node_shard_secrets[n["node_id"]] = _b64.b64decode(
+                            n["shard_secret"])
         except Exception:
             pass
 
@@ -1762,9 +1817,10 @@ class DFSClient:
             if not direct_url:
                 return None
             try:
+                _secret = node_shard_secrets.get(node_id)
                 token = self._shard_token(
                     node_id, self.keypair.fingerprint(),
-                    file_id, idx)
+                    file_id, idx, shard_secret=_secret)
                 url = (f"{direct_url}/shard"
                        f"?file_id={file_id}&index={idx}"
                        f"&token={token}")

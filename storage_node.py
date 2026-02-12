@@ -15,6 +15,7 @@ On-disk layout: ``<storage_dir>/<node_id>/<file_id>_<shard_index>.shard``
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -68,6 +69,12 @@ class StorageNode:
         self._http_server = None          # aiohttp web.AppRunner
         self._http_port: int = 0          # 0 = OS-assigned
         self._direct_url: Optional[str] = None  # e.g. "http://1.2.3.4:7001"
+
+        # Cryptographic secret for HMAC shard-access tokens.
+        # Generated randomly at startup — NOT derived from node_id, which is
+        # public. The secret is communicated to authorized clients via the
+        # tracker's authenticated channel (heartbeat response / node list).
+        self._shard_secret: bytes = os.urandom(32)
 
         # UPnP port mapping for NAT traversal.
         self._upnp_mapped_port: int = 0   # external port if UPnP succeeded
@@ -274,6 +281,8 @@ class StorageNode:
                     }
                     if self._direct_url:
                         hb_headers["direct_url"] = self._direct_url
+                        hb_headers["shard_secret"] = base64.b64encode(
+                            self._shard_secret).decode("ascii")
                     msg = Message(MsgType.HEARTBEAT, hb_headers)
                     await send_message(writer, msg)
                     writer.close()
@@ -299,6 +308,8 @@ class StorageNode:
         }
         if self._direct_url:
             hb["direct_url"] = self._direct_url
+            hb["shard_secret"] = base64.b64encode(
+                self._shard_secret).decode("ascii")
         payload = json.dumps(hb).encode("utf-8")
         url = self.heartbeat_url
         # Auto-detect CGI vs REST
@@ -359,6 +370,8 @@ class StorageNode:
         }
         if self._direct_url:
             poll_hb["direct_url"] = self._direct_url
+            poll_hb["shard_secret"] = base64.b64encode(
+                self._shard_secret).decode("ascii")
         payload = json.dumps(poll_hb).encode("utf-8")
 
         def _do_poll():
@@ -553,14 +566,11 @@ class StorageNode:
                      self.node_id)
             return
 
-        # Per-node secret for HMAC token verification.  Derived from the
-        # node's current ID, which may change after the first server poll
-        # assigns a canonical ID (e.g. "node-0" → "node-0-a3f7b2c1").
-        # Must be computed dynamically so it stays in sync.
+        # Per-node secret for HMAC token verification.
+        # Uses the cryptographically random secret generated at startup,
+        # NOT derived from the node_id (which is public and predictable).
         def _node_secret():
-            return _hashlib.sha256(
-                f"oriku-shard-token:{this.node_id}"
-                .encode()).digest()
+            return this._shard_secret
         _TOKEN_TTL = 300  # 5 minutes
 
         def _verify_token(file_id: str, index: int,

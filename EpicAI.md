@@ -50,10 +50,14 @@ Each test spins up an in-process cluster (tracker + nodes on random ports) and t
 
 ### Run a single test
 ```
-python test_integration.py
-pytest test_integration.py -v
-pytest test_integration.py::test_name -v
+pytest test_integration.py::test_convergent_encryption -v
 ```
+
+### Build executable (PyInstaller)
+```
+pyinstaller oriku-fs.spec
+```
+Outputs to `dist/oriku-fs/`. The spec bundles all Python modules, dashboard template, and handles platform-specific exclusions.
 
 ### Key launcher flags
 | Flag | Purpose |
@@ -64,8 +68,9 @@ pytest test_integration.py::test_name -v
 | `--donated-gb N` | Disk per node in GiB (default: 10) |
 | `--watch-dir DIR` | Directory to auto-sync |
 | `--key-dir DIR` | RSA keypair directory (default: `./keys`) |
-| `--password PW` | Encrypt/decrypt private key with password (uses scrypt KDF) |
-| `-k N` / `-m N` | Erasure coding params: data shards / parity shards (default: 3/3) |
+| `--password PW` | Encrypt private key at generation time (scrypt KDF → AES-GCM) |
+| `-k N` / `-m N` | Erasure coding: data shards / parity shards (default: 3/3) |
+| `--no-adaptive` | Disable adaptive redundancy (uses fixed -k/-m instead) |
 | `--dashboard` / `--no-dashboard` | Web dashboard on `--dashboard-port` (default: 9090) |
 | `--tray` | macOS menu bar app |
 | `--tracker-only` / `--node-only` | Run only tracker or only a storage node |
@@ -133,6 +138,14 @@ Stateless CGI alternative to the long-running `tracker.py` + `tracker_http.py`. 
 
 **Public routes** (no auth required): `health`, `nodes`, `register`, `heartbeat`, `shard.fetch`, `groups.list`.
 
+**Starting the CGI server locally:**
+```
+./serve.sh      # Linux
+./serve_mac.sh  # macOS
+./serve_pi.sh   # Raspberry Pi
+```
+These loop-restart `ensoservd` (or its platform variants) which reads `ensocdn.cfg`.
+
 ### `ensoservd`
 
 Pre-compiled HTTP proxy binary (Linux/macOS/Pi variants) configured via `ensocdn.cfg`. Serves CGI scripts from `enso/` and handles virtual hosts. The `serve*.sh` scripts loop-restart it.
@@ -155,7 +168,7 @@ Users must donate storage to store files. Quota = donated bytes × uptime_fracti
 ### Advanced features
 
 - **Swarming**: BitTorrent-style peer content distribution. Clients with cached shards can register as peers via `REGISTER_PEER`; other clients fetch shards directly from peers with tit-for-tat tracking (bytes served/received per peer).
-- **Adaptive redundancy**: Tracker recommends (k, m) based on measured node availability using a binomial durability model (target: six-nines durability). Use `client.put_adaptive()` for automatic parameter selection.
+- **Adaptive redundancy**: Tracker recommends (k, m) based on measured node availability using a binomial durability model (target: six-nines durability). Use `client.put_adaptive()` for automatic parameter selection (enabled by default in watcher, disable with `--no-adaptive`).
 - **Client-side repair**: Clients can check shard health via `check_shard_health()` and trigger repair for files with dead shards.
 - **Direct client→node transfers**: Storage nodes can expose HTTP endpoints (`direct_url` in heartbeat) for direct shard fetch/store, bypassing tracker proxy. Uses HMAC shard tokens for authentication.
 - **Cross-user dedup**: Same content uploaded by different users with convergent encryption shares shards (content-addressed file IDs via `content_addressed_file_id`).
@@ -182,4 +195,11 @@ aiohttp web app serving Jinja2 templates from `web/templates/dashboard.html`. Po
 | `node_storage/` | On-disk shard files (`<node_id>/<file_id>_<shard_index>.shard`) | Yes |
 | `cache/` | Local shard cache for downloads | Yes |
 | `enso/` | CGI server scripts + state files (`files.json`, `nodes.json`) | Partially (state files ignored) |
+| `enso/staging/` | Temporary staging area for CGI shard operations | Yes |
 | `web/templates/` | Dashboard HTML template (`dashboard.html`) | No |
+
+## Development notes
+
+- **State file locking**: The CGI server (`enso/api.py`) uses `flock()` on JSON state files. When debugging, ensure locks are released (killing the CGI script mid-write can leave stale locks).
+- **Commit messages**: The `.commitmsg` file in the repo root contains the message for the next commit—update it before committing to document changes.
+- **Test isolation**: Tests bind to port 0 (OS-assigned) to avoid conflicts. Each test creates its own temporary storage directories that are cleaned up on exit.

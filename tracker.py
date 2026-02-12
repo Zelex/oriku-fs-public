@@ -52,6 +52,9 @@ class NodeInfo:
     # Direct HTTP URL for client↔node shard transfer (set via heartbeat).
     # When present, clients can fetch/store shards directly without proxy.
     direct_url: Optional[str] = None
+    # Per-node HMAC secret for shard access tokens (base64-encoded).
+    # Relayed to authenticated clients so they can generate valid tokens.
+    shard_secret: Optional[str] = None
     _heartbeat_count: int = field(default=0, repr=False)
     _miss_count: int = field(default=0, repr=False)
     # Uptime tracking for Wuala-style storage trading.
@@ -228,6 +231,7 @@ class MetadataTracker:
             n.free_bytes = hdr.get("free_bytes", n.free_bytes)
             n.shard_count = hdr.get("shard_count", n.shard_count)
             n.direct_url = hdr.get("direct_url", n.direct_url)
+            n.shard_secret = hdr.get("shard_secret", n.shard_secret)
             n.record_heartbeat()
         else:
             self.nodes[nid] = NodeInfo(
@@ -240,6 +244,7 @@ class MetadataTracker:
                 free_bytes=hdr.get("free_bytes", 0),
                 shard_count=hdr.get("shard_count", 0),
                 direct_url=hdr.get("direct_url"),
+                shard_secret=hdr.get("shard_secret"),
             )
             log.info("Registered node %s @ %s:%d  donated=%d MiB",
                      nid, hdr["host"], hdr["port"],
@@ -1012,7 +1017,8 @@ class MetadataTracker:
                     {"node_id": n.node_id, "host": n.host, "port": n.port,
                      "free_bytes": n.free_bytes, "availability": round(n.availability, 3),
                      "uptime_fraction": round(n.uptime_fraction, 4),
-                     "direct_url": n.direct_url}
+                     "direct_url": n.direct_url,
+                     "shard_secret": n.shard_secret}
                     for n in self.alive_nodes()
                 ]
                 await send_message(writer, Message(MsgType.NODE_LIST, {"nodes": nodes}))

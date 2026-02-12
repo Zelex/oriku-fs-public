@@ -71,16 +71,30 @@ class StorageNode:
         self._direct_url: Optional[str] = None  # e.g. "http://1.2.3.4:7001"
 
         # Cryptographic secret for HMAC shard-access tokens.
-        # Generated randomly at startup — NOT derived from node_id, which is
-        # public. The secret is communicated to authorized clients via the
-        # tracker's authenticated channel (heartbeat response / node list).
-        self._shard_secret: bytes = os.urandom(32)
+        # Persisted to disk so it survives restarts — avoids stale-secret
+        # 403 errors when the CGI still has the old secret cached.
+        self._shard_secret: bytes = self._load_or_create_secret()
 
         # UPnP port mapping for NAT traversal.
         self._upnp_mapped_port: int = 0   # external port if UPnP succeeded
         self._upnp_external_ip: str = ""  # external IP from UPnP
 
     # -- IP detection -------------------------------------------------------
+
+    def _load_or_create_secret(self) -> bytes:
+        """Load shard secret from disk, or generate and save a new one."""
+        secret_path = self.storage_dir / ".shard_secret"
+        try:
+            if secret_path.exists():
+                return secret_path.read_bytes()
+        except Exception:
+            pass
+        secret = os.urandom(32)
+        try:
+            secret_path.write_bytes(secret)
+        except Exception:
+            pass  # If we can't persist, at least use it for this session
+        return secret
 
     @staticmethod
     def _detect_ip() -> str:

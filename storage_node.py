@@ -152,6 +152,11 @@ class StorageNode:
 
     def store_shard(self, file_id: str, index: int, data: bytes) -> None:
         path = self._shard_path(file_id, index)
+        # Skip write if identical shard already exists (convergent dedup).
+        if path.exists() and path.stat().st_size == len(data):
+            log.debug("[%s] Shard %s/%d already exists, skipping",
+                      self.node_id, file_id[:12], index)
+            return
         path.write_bytes(data)
         log.info("[%s] Stored shard %s/%d (%d B)", self.node_id, file_id[:12], index, len(data))
 
@@ -645,6 +650,14 @@ class StorageNode:
             if not _verify_token(fid, idx, token):
                 return web.json_response(
                     {"error": "unauthorized"}, status=403)
+            # Skip if shard already exists with same size (convergent dedup).
+            if this.has_shard(fid, idx):
+                existing = this._shard_path(fid, idx)
+                content_length = request.content_length or 0
+                if content_length and existing.stat().st_size == content_length:
+                    # Drain the body to avoid connection errors.
+                    await request.read()
+                    return web.json_response({"status": "ok", "existed": True})
             data = await request.read()
             if len(data) > MAX_SHARD_BODY:
                 return web.json_response(

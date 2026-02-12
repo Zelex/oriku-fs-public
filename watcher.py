@@ -558,12 +558,19 @@ class DirectoryWatcher:
         log.info("  Convergent encryption: %s", self.convergent)
         log.info("  Sync shared files: %s", self.sync_shared)
         log.info("  Client-side repair interval: %.0fs", self._repair_interval)
-        log.info("  Tracked files: %d", len(self.db.files))
+        log.info("  Previously synced files: %d (scanning for new…)",
+                 len(self.db.files))
 
+        _first_scan = True
         try:
             while self._running:
                 try:
                     await self._sync_once()
+                    if _first_scan:
+                        _first_scan = False
+                        total = len(self.db.files)
+                        log.info("  Initial scan complete: %d file(s) tracked.",
+                                 total)
                 except Exception:
                     log.exception("Sync cycle failed")
                 await asyncio.sleep(self.poll_interval)

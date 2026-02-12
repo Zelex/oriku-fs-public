@@ -270,13 +270,7 @@ class HTTPTransport:
     # -- Tracker operations -------------------------------------------------
 
     async def get_alive_nodes(self) -> List[dict]:
-        # Send auth params if available — the server includes shard_secret
-        # for authenticated callers, needed for direct node transfers.
-        if self._keypair:
-            url = self._signed_url("nodes")
-        else:
-            url = self._url("nodes")
-        async with await self._get(url) as resp:
+        async with await self._get(self._url("nodes")) as resp:
             data = await resp.json()
             return data.get("nodes", [])
 
@@ -469,7 +463,9 @@ class LocalCache:
 
     def _evict_if_needed(self, incoming: int) -> None:
         """Evict oldest entries until there's room."""
-        entries = sorted(self.cache_dir.iterdir(), key=lambda p: p.stat().st_mtime)
+        entries = sorted(
+            [p for p in self.cache_dir.iterdir() if p.is_file()],
+            key=lambda p: p.stat().st_mtime)
         total = sum(p.stat().st_size for p in entries)
         while total + incoming > self.max_bytes and entries:
             victim = entries.pop(0)

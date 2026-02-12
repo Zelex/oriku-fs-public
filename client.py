@@ -992,7 +992,12 @@ class DFSClient:
 
         # Generate and cache spare shards for client-side repair.
         # These allow fast repair without re-reading the original file.
-        self._save_spare_shards(fid, chunks_meta, aes_key, data)
+        # Run in a thread so it doesn't block the caller — spare shard
+        # generation is CPU-heavy (re-encrypt + re-encode every chunk).
+        import asyncio as _asyncio
+        loop = _asyncio.get_running_loop()
+        loop.run_in_executor(
+            None, self._save_spare_shards, fid, chunks_meta, aes_key, data)
 
         # Auto-share with group if requested.
         if group_id and self._http:

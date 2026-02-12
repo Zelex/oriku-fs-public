@@ -156,13 +156,25 @@ class StorageNode:
         if path.exists() and path.stat().st_size == len(data):
             log.debug("[%s] Shard %s/%d already exists, skipping",
                       self.node_id, file_id[:12], index)
+            # Touch to update access time so it's not evicted.
+            os.utime(path)
             return
+        # If not enough space, try to evict old shards first.
+        if len(data) > self.free_bytes:
+            self._evict_shards(len(data))
         path.write_bytes(data)
         log.info("[%s] Stored shard %s/%d (%d B)", self.node_id, file_id[:12], index, len(data))
 
     def fetch_shard(self, file_id: str, index: int) -> Optional[bytes]:
         path = self._shard_path(file_id, index)
-        return path.read_bytes() if path.exists() else None
+        if path.exists():
+            # Touch access time so LRU eviction keeps hot shards.
+            try:
+                os.utime(path)
+            except OSError:
+                pass
+            return path.read_bytes()
+        return None
 
     def delete_shard(self, file_id: str, index: int) -> bool:
         path = self._shard_path(file_id, index)
@@ -173,6 +185,43 @@ class StorageNode:
 
     def has_shard(self, file_id: str, index: int) -> bool:
         return self._shard_path(file_id, index).exists()
+
+    def _evict_shards(self, needed_bytes: int) -> int:
+        """
+        LRU eviction: remove the least-recently-accessed shards until
+        *needed_bytes* of free space is available.
+
+        Uses mtime (last modification/touch time) as the LRU indicator.
+        Returns the number of bytes freed.
+        """
+        shards = []
+        for f in self.storage_dir.iterdir():
+            if f.is_file() and f.suffix == ".shard":
+                try:
+                    st = f.stat()
+                    shards.append((st.st_mtime, st.st_size, f))
+                except OSError:
+                    continue
+
+        # Sort oldest first (lowest mtime = least recently used).
+        shards.sort(key=lambda x: x[0])
+
+        freed = 0
+        evicted = 0
+        for _mtime, size, path in shards:
+            if self.free_bytes + freed >= needed_bytes:
+                break
+            try:
+                path.unlink()
+                freed += size
+                evicted += 1
+            except OSError:
+                continue
+
+        if evicted > 0:
+            log.info("[%s] LRU eviction: removed %d shard(s), freed %d bytes",
+                     self.node_id, evicted, freed)
+        return freed
 
     # -- Request handler ----------------------------------------------------
 
@@ -188,6 +237,8 @@ class StorageNode:
             if msg.msg_type == MsgType.STORE_SHARD:
                 fid = msg.headers["file_id"]
                 idx = msg.headers["index"]
+                if len(msg.payload) > self.free_bytes:
+                    self._evict_shards(len(msg.payload))
                 if len(msg.payload) > self.free_bytes:
                     await send_message(writer, Message(
                         MsgType.ERROR, {"reason": "insufficient_capacity"}))
@@ -663,8 +714,10 @@ class StorageNode:
                 return web.json_response(
                     {"error": "shard_too_large"}, status=413)
             if len(data) > this.free_bytes:
-                return web.json_response(
-                    {"error": "insufficient_capacity"}, status=507)
+                this._evict_shards(len(data))
+                if len(data) > this.free_bytes:
+                    return web.json_response(
+                        {"error": "insufficient_capacity"}, status=507)
             try:
                 this.store_shard(fid, idx, data)
             except ValueError:

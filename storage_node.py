@@ -281,6 +281,8 @@ class StorageNode:
                     }
                     if self._direct_url:
                         hb_headers["direct_url"] = self._direct_url
+                        hb_headers["direct_url_local"] = getattr(
+                            self, '_direct_url_local', self._direct_url)
                         hb_headers["shard_secret"] = base64.b64encode(
                             self._shard_secret).decode("ascii")
                     msg = Message(MsgType.HEARTBEAT, hb_headers)
@@ -308,6 +310,8 @@ class StorageNode:
         }
         if self._direct_url:
             hb["direct_url"] = self._direct_url
+            hb["direct_url_local"] = getattr(
+                self, '_direct_url_local', self._direct_url)
             hb["shard_secret"] = base64.b64encode(
                 self._shard_secret).decode("ascii")
         payload = json.dumps(hb).encode("utf-8")
@@ -370,6 +374,8 @@ class StorageNode:
         }
         if self._direct_url:
             poll_hb["direct_url"] = self._direct_url
+            poll_hb["direct_url_local"] = getattr(
+                self, '_direct_url_local', self._direct_url)
             poll_hb["shard_secret"] = base64.b64encode(
                 self._shard_secret).decode("ascii")
         payload = json.dumps(poll_hb).encode("utf-8")
@@ -661,12 +667,14 @@ class StorageNode:
 
         # Build the direct URL. Prefer UPnP external IP if available,
         # otherwise use the LAN IP.
+        # Always keep the LAN URL so same-network clients can skip NAT.
+        self._direct_url_local = (f"http://{self.advertise_host}"
+                                  f":{self._http_port}")
         if self._upnp_external_ip and self._upnp_mapped_port:
             self._direct_url = (f"http://{self._upnp_external_ip}"
                                 f":{self._upnp_mapped_port}")
         else:
-            self._direct_url = (f"http://{self.advertise_host}"
-                                f":{self._http_port}")
+            self._direct_url = self._direct_url_local
 
         log.info("[%s] Direct HTTP shard server on port %d  (URL: %s)",
                  self.node_id, self._http_port, self._direct_url)

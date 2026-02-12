@@ -52,6 +52,7 @@ class NodeInfo:
     # Direct HTTP URL for client↔node shard transfer (set via heartbeat).
     # When present, clients can fetch/store shards directly without proxy.
     direct_url: Optional[str] = None
+    direct_url_local: Optional[str] = None
     # Per-node HMAC secret for shard access tokens (base64-encoded).
     # Relayed to authenticated clients so they can generate valid tokens.
     shard_secret: Optional[str] = None
@@ -231,6 +232,7 @@ class MetadataTracker:
             n.free_bytes = hdr.get("free_bytes", n.free_bytes)
             n.shard_count = hdr.get("shard_count", n.shard_count)
             n.direct_url = hdr.get("direct_url", n.direct_url)
+            n.direct_url_local = hdr.get("direct_url_local", n.direct_url_local)
             n.shard_secret = hdr.get("shard_secret", n.shard_secret)
             n.record_heartbeat()
         else:
@@ -244,6 +246,7 @@ class MetadataTracker:
                 free_bytes=hdr.get("free_bytes", 0),
                 shard_count=hdr.get("shard_count", 0),
                 direct_url=hdr.get("direct_url"),
+                direct_url_local=hdr.get("direct_url_local"),
                 shard_secret=hdr.get("shard_secret"),
             )
             log.info("Registered node %s @ %s:%d  donated=%d MiB",

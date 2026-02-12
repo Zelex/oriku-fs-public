@@ -233,6 +233,7 @@ def create_http_app(tracker: MetadataTracker) -> web.Application:
              "used_bytes": n.used_bytes, "shard_count": n.shard_count,
              "availability": round(n.availability, 3), "alive": n.alive,
              "direct_url": n.direct_url,
+             "direct_url_local": n.direct_url_local,
              "shard_secret": n.shard_secret}
             for n in t.alive_nodes()
         ]

@@ -778,30 +778,39 @@ class DFSClient:
 
         # -- Try direct transfer first ------------------------------------
         if direct_url and self._http:
-            try:
-                import aiohttp as _aiohttp
-                await self._http._ensure_session()
-                _secret = None
-                if node.get("shard_secret"):
-                    import base64 as _b64
-                    _secret = _b64.b64decode(node["shard_secret"])
-                token = self._shard_token(
-                    node["node_id"], self.keypair.fingerprint(),
-                    file_id, index, shard_secret=_secret)
-                url = (f"{direct_url}/shard"
-                       f"?file_id={file_id}&index={index}"
-                       f"&token={token}")
-                async with self._http._session.post(
-                        url, data=data,
-                        timeout=_aiohttp.ClientTimeout(total=15)
-                ) as resp:
-                    if resp.status == 200:
-                        return  # Success — direct transfer worked!
-                    log.debug("Direct store shard %d to %s: HTTP %d",
-                              index, direct_url, resp.status)
-            except Exception as exc:
-                log.debug("Direct store shard %d to %s failed: %s",
-                          index, direct_url, exc)
+            # Try local URL first (same LAN, avoids hairpin NAT), then
+            # the public URL (UPnP external IP for remote clients).
+            urls_to_try = []
+            local_url = node.get("direct_url_local")
+            if local_url and local_url != direct_url:
+                urls_to_try.append(local_url)
+            urls_to_try.append(direct_url)
+
+            for durl in urls_to_try:
+                try:
+                    import aiohttp as _aiohttp
+                    await self._http._ensure_session()
+                    _secret = None
+                    if node.get("shard_secret"):
+                        import base64 as _b64
+                        _secret = _b64.b64decode(node["shard_secret"])
+                    token = self._shard_token(
+                        node["node_id"], self.keypair.fingerprint(),
+                        file_id, index, shard_secret=_secret)
+                    url = (f"{durl}/shard"
+                           f"?file_id={file_id}&index={index}"
+                           f"&token={token}")
+                    async with self._http._session.post(
+                            url, data=data,
+                            timeout=_aiohttp.ClientTimeout(total=15)
+                    ) as resp:
+                        if resp.status == 200:
+                            return  # Success — direct transfer worked!
+                        log.debug("Direct store shard %d to %s: HTTP %d",
+                                  index, durl, resp.status)
+                except Exception as exc:
+                    log.debug("Direct store shard %d to %s failed: %s",
+                              index, durl, exc)
 
         # -- Fallback to tracker proxy ------------------------------------
         if self._http:
@@ -1781,12 +1790,15 @@ class DFSClient:
 
         # --- Tier 2: Direct node transfer ---------------------------------
         node_direct_urls: Dict[str, str] = {}
+        node_direct_urls_local: Dict[str, str] = {}
         node_shard_secrets: Dict[str, bytes] = {}
         try:
             nodes = await self.get_alive_nodes()
             for n in nodes:
                 if n.get("direct_url"):
                     node_direct_urls[n["node_id"]] = n["direct_url"]
+                    if n.get("direct_url_local"):
+                        node_direct_urls_local[n["node_id"]] = n["direct_url_local"]
                     if n.get("shard_secret"):
                         import base64 as _b64
                         node_shard_secrets[n["node_id"]] = _b64.b64decode(
@@ -1812,30 +1824,37 @@ class DFSClient:
             direct_url = node_direct_urls.get(node_id)
             if not direct_url:
                 return None
-            try:
-                _secret = node_shard_secrets.get(node_id)
-                token = self._shard_token(
-                    node_id, self.keypair.fingerprint(),
-                    file_id, idx, shard_secret=_secret)
-                url = (f"{direct_url}/shard"
-                       f"?file_id={file_id}&index={idx}"
-                       f"&token={token}")
-                await self._http._ensure_session()
-                async with self._http._session.get(
-                        url, timeout=_aiohttp.ClientTimeout(total=15)
-                ) as resp:
-                    if resp.status != 200:
-                        log.debug("  Direct fetch shard %d from %s: HTTP %d",
-                                  idx, direct_url, resp.status)
-                        return None
-                    data = await resp.read()
-                    shard = _make_shard(idx, data)
-                    if shard.verify():
-                        return shard
-                    log.warning("  Direct fetch shard %d: hash mismatch", idx)
-            except Exception as exc:
-                log.debug("  Direct fetch shard %d from %s failed: %s",
-                          idx, direct_url, exc)
+            # Try local URL first (same LAN), then public URL.
+            urls = []
+            local = node_direct_urls_local.get(node_id)
+            if local and local != direct_url:
+                urls.append(local)
+            urls.append(direct_url)
+            for durl in urls:
+                try:
+                    _secret = node_shard_secrets.get(node_id)
+                    token = self._shard_token(
+                        node_id, self.keypair.fingerprint(),
+                        file_id, idx, shard_secret=_secret)
+                    url = (f"{durl}/shard"
+                           f"?file_id={file_id}&index={idx}"
+                           f"&token={token}")
+                    await self._http._ensure_session()
+                    async with self._http._session.get(
+                            url, timeout=_aiohttp.ClientTimeout(total=15)
+                    ) as resp:
+                        if resp.status != 200:
+                            log.debug("  Direct fetch shard %d from %s: HTTP %d",
+                                      idx, durl, resp.status)
+                            continue
+                        data = await resp.read()
+                        shard = _make_shard(idx, data)
+                        if shard.verify():
+                            return shard
+                        log.warning("  Direct fetch shard %d: hash mismatch", idx)
+                except Exception as exc:
+                    log.debug("  Direct fetch shard %d from %s failed: %s",
+                              idx, durl, exc)
             return None
 
         if remaining:

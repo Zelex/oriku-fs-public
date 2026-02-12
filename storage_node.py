@@ -584,10 +584,13 @@ class StorageNode:
             return
 
         # Per-node secret for HMAC token verification.
-        # Uses the cryptographically random secret generated at startup,
-        # NOT derived from the node_id (which is public and predictable).
+        # Derived deterministically from the current node_id so both client
+        # and node agree.  Uses a closure to always read the CURRENT
+        # node_id (which may be updated by the server after registration).
         def _node_secret():
-            return this._shard_secret
+            return _hashlib.sha256(
+                f"oriku-shard-token:{this.node_id}".encode()
+            ).digest()
         _TOKEN_TTL = 300  # 5 minutes
 
         def _verify_token(file_id: str, index: int,

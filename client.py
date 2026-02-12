@@ -270,7 +270,10 @@ class HTTPTransport:
     # -- Tracker operations -------------------------------------------------
 
     async def get_alive_nodes(self) -> List[dict]:
-        async with await self._get(self._url("nodes")) as resp:
+        # Use a signed request so the server can include direct_url
+        # in the response (only revealed to authenticated callers).
+        url = self._signed_url("nodes")
+        async with await self._get(url) as resp:
             data = await resp.json()
             return data.get("nodes", [])
 

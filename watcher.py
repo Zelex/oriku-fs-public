@@ -248,7 +248,9 @@ class DirectoryWatcher:
                      file_id[:12])
             return file_id
         except Exception as exc:
-            log.error("Failed to upload %s: %s", rel_path, exc)
+            log.error("Failed to upload %s: %s: %s", rel_path,
+                     type(exc).__name__, exc)
+            log.debug("Upload traceback:", exc_info=True)
             self._stats["errors"] += 1
             return None
 
@@ -268,7 +270,9 @@ class DirectoryWatcher:
         try:
             all_files = await self.client.list_files()
         except Exception as exc:
-            log.warning("Could not list files for shared sync: %s", exc)
+            log.warning("Could not list files for shared sync: %s: %s",
+                        type(exc).__name__, exc)
+            log.debug("Shared sync traceback:", exc_info=True)
             return
 
         shared_files = [f for f in all_files if f.get("shared_with_me")]

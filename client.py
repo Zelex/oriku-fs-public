@@ -310,6 +310,10 @@ class HTTPTransport:
     async def list_files(self, owner_fingerprint: str) -> List[dict]:
         url = self._signed_url("files", owner=owner_fingerprint)
         async with await self._get(url) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                raise RuntimeError(
+                    f"list_files failed (HTTP {resp.status}): {body[:200]}")
             data = await resp.json()
             return data.get("files", [])
 
@@ -681,6 +685,10 @@ class DFSClient:
         # repair without needing to re-read the original file.
         self._spare_shard_dir = Path(cache_dir) / "spare_shards"
         self._spare_shard_enabled = True
+
+        # Node list cache — avoid hammering the server on every operation.
+        self._nodes_cache: List[dict] = []
+        self._nodes_cache_time: float = 0.0
         try:
             self._spare_shard_dir.mkdir(parents=True, exist_ok=True)
         except (OSError, PermissionError) as e:
@@ -745,11 +753,29 @@ class DFSClient:
         """Send a message to the tracker over raw TCP."""
         return await _request(self.tracker_host, self.tracker_port, msg)
 
-    async def get_alive_nodes(self) -> List[dict]:
+    _NODES_CACHE_TTL: float = 30.0  # seconds
+
+    async def get_alive_nodes(self, force: bool = False) -> List[dict]:
+        """Return alive nodes, cached for up to _NODES_CACHE_TTL seconds."""
+        now = time.time()
+        if (not force
+                and self._nodes_cache
+                and now - self._nodes_cache_time < self._NODES_CACHE_TTL):
+            return self._nodes_cache
+
         if self._http:
-            return await self._http.get_alive_nodes()
-        resp = await self._tracker(Message(MsgType.NODE_LIST))
-        return resp.headers.get("nodes", [])
+            nodes = await self._http.get_alive_nodes()
+        else:
+            resp = await self._tracker(Message(MsgType.NODE_LIST))
+            nodes = resp.headers.get("nodes", [])
+
+        self._nodes_cache = nodes
+        self._nodes_cache_time = now
+        return nodes
+
+    def invalidate_nodes_cache(self) -> None:
+        """Force next get_alive_nodes() to fetch fresh data."""
+        self._nodes_cache_time = 0.0
 
     async def _resolve_node(self, node_id: str) -> Tuple[str, int]:
         for n in await self.get_alive_nodes():
